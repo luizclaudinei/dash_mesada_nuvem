@@ -1,141 +1,191 @@
 import streamlit as st
 from datetime import datetime
-import os
 import pandas as pd
 import plotly.express as px
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-st.set_page_config(page_title = "Dashboard - Mesada", layout="wide")
+st.set_page_config(page_title="Dashboard - Mesada", layout="wide")
 
-caminho_transacoes = "transacoesmesada.csv"
+if "autenticado" not in st.session_state:
+    st.session_state.autenticado = False
+
+if not st.session_state.autenticado:
+    st.title("🔐 Dashboard Mesada - Login Privado")
+    senha = st.text_input("Insira a senha para acessar", type="password")
+    
+    if st.button("Entrar"):
+        if senha == st.secrets.get("senha_app", ""):
+            st.session_state.autenticado = True
+            st.rerun()
+        else:
+            st.error("❌ Senha incorreta!")
+    st.stop()
+
+@st.cache_resource
+def conectar_neon():
+    try:
+        return psycopg2.connect(st.secrets["database_url"])
+    except Exception as e:
+        st.error(f"❌ Erro ao conectar ao Neon: {e}")
+        st.stop()
+
+conn = conectar_neon()
+
+def criar_tabela():
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS transacoes (
+                    id SERIAL PRIMARY KEY,
+                    data DATE NOT NULL,
+                    descricao VARCHAR(255) NOT NULL,
+                    categoria VARCHAR(100) NOT NULL,
+                    valor NUMERIC(10, 2) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.commit()
+    except Exception as e:
+        st.error(f"❌ Erro ao criar tabela: {e}")
+
+criar_tabela()
+
+def carregar_dados():
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT data, descricao, categoria, valor FROM transacoes ORDER BY data DESC;")
+            registros = cur.fetchall()
+        
+        if registros:
+            df = pd.DataFrame(registros)
+            df["data"] = pd.to_datetime(df["data"])
+            return df
+        else:
+            return pd.DataFrame(columns=["data", "descricao", "categoria", "valor"])
+    except Exception as e:
+        st.error(f"❌ Erro ao carregar dados: {e}")
+        return pd.DataFrame(columns=["data", "descricao", "categoria", "valor"])
 
 if "dados" not in st.session_state:
-        
-        if os.path.exists(caminho_transacoes):
-                st.session_state.dados = pd.read_csv (caminho_transacoes, parse_dates=["Data"])
-                #converter coluna Valor para numérico
-                st.session_state.dados["Valor"] = pd.to_numeric(st.session_state.dados["Valor"], errors='coerce')
-        else:
-                st.session_state.dados = pd.DataFrame(columns= ["Data", "Descrição", "Categoria", "Valor"])
+    st.session_state.dados = carregar_dados()
 
-st.sidebar.title("Adicionar Transação")
+st.sidebar.title("➕ Adicionar Transação")
 
 CATEGORIAS = ["Jardinagem", "Vestuário", "Alimentação", "Diversos", "Mesada", "Transporte", "Lazer", "Moradia", "Investimentos"]
 
-with st.sidebar.form(key = "form_transacoes", clear_on_submit=True):
-
-        data = st.date_input("Data", value=datetime.today())
-        descricao = st.text_input("Descrição")
-        categoria = st.selectbox("Categoria", CATEGORIAS)
-        valor = st.number_input("Valor (positivo = entrada, negativo = saída)",
-                                step=1)
-        botao_enviar = st.form_submit_button("Adicionar")
-
+with st.sidebar.form(key="form_transacoes", clear_on_submit=True):
+    data = st.date_input("Data", value=datetime.today())
+    descricao = st.text_input("Descrição")
+    categoria = st.selectbox("Categoria", CATEGORIAS)
+    valor = st.number_input("Valor (positivo = entrada, negativo = saída)", step=1)
+    botao_enviar = st.form_submit_button("✅ Adicionar")
 
 if botao_enviar:
-        
-        st.session_state.dados = pd.concat(
-            [
-                st.session_state.dados,
-                pd.DataFrame({
+    if not descricao:
+        st.error("❌ Descrição é obrigatória!")
+    elif valor == 0:
+        st.error("❌ Valor não pode ser zero!")
+    else:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO transacoes (data, descricao, categoria, valor) VALUES (%s, %s, %s, %s)",
+                    (data, descricao, categoria, float(valor))
+                )
+                conn.commit()
+            
+            st.success("✅ Transação adicionada com sucesso!")
+            st.session_state.dados = carregar_dados()
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Erro ao adicionar transação: {e}")
 
-                        "Data": [pd.to_datetime(data)],
-                        "Descrição": [descricao],
-                        "Categoria": [categoria],
-                        "Valor": [valor]
+df = carregar_dados()
 
-                })   
-            ], ignore_index=True
-        )
-        st.success("Transação adicionada!")
-        st.session_state.dados.to_csv(caminho_transacoes, index = False)
-
-if st.session_state.dados.empty:
-        st.info("Adicione transações para começar.")
-
-df = st.session_state.dados.copy()
-df["Data"] = pd.to_datetime(df["Data"]).dt.normalize()
-df.sort_values("Data", inplace=True)
-
-with st.sidebar.expander("filtros", expanded=False):
-
-        categorias_filtro = st.multiselect("Categorias",
-                                   options=sorted(df["Categoria"].dropna().unique()),
-                                   default=sorted(df["Categoria"].dropna().unique()))
-
-# Verificar se há dados antes de definir período
-        if not df.empty:
-                inicio_periodo, final_periodo = st.date_input("Período",
-                                        value=(df["Data"].min().date(),
-                                                df["Data"].max().date()))
-        else:
-                # Valores padrão quando não há dados
-                hoje = datetime.today().date()
-                inicio_periodo, final_periodo = st.date_input("Período",
-                                        value=(hoje, hoje))
-
-
-df_filtrado = df.loc[(df["Categoria"].isin(categorias_filtro)) & (df["Data"].between(pd.to_datetime(inicio_periodo), pd.to_datetime(final_periodo)))]
-
-
-entradas = df_filtrado.loc[df_filtrado["Valor"] > 0, "Valor"].sum()
-saidas = df_filtrado.loc[df_filtrado["Valor"] < 0, "Valor"].sum()
-saldo = entradas + saidas
-
-metrica1, metrica2, metrica3 = st.columns(3)
-metrica1.metric("Entradas", f"R$ {entradas:,.2f}")
-metrica2.metric("Saídas", f"R$ {saidas:,.2f}")
-metrica3.metric("Saldo", f"R$ {saldo:,.2f}")
-
-st.markdown("## Transações")
-
-st.dataframe(
-        df_filtrado.style.format({"Data": "{:%Y-%m-%d}"}),
-        use_container_width=True,
-        hide_index=True
-)
-
-with st.expander("Editar ou excluir transações"):
-
-        edicao_df = st.data_editor(
-                st.session_state.dados,
-                num_rows="dynamic",
-                use_container_width=True,
-                hide_index=True               
-        )
-
-        if st.button("Salvar alterações"):
-                edicao_df = edicao_df.dropna()
-                st.session_state.dados = edicao_df
-                st.session_state.dados.to_csv(caminho_transacoes, index = False)
-                st.rerun()
-
-        
-
-if df_filtrado.empty:
-        st.warning("Sem dados no intervalo selecionado")
-
+if df.empty:
+    st.info("📊 Adicione transações para começar.")
 else:
-        
-        linha_grafico = df_filtrado.groupby("Data").sum().cumsum().reset_index()
-        grafico_saldo = px.line(linha_grafico, x = "Data", y = "Valor", title="Evolução de Saldo Diário")
-        grafico_saldo.update_xaxes(tickformat = "%d %b %Y")
-        st.plotly_chart(grafico_saldo, use_container_width=True)
+    df_filtro = df.copy()
+    df_filtro["data"] = pd.to_datetime(df_filtro["data"]).dt.normalize()
+    df_filtro.sort_values("data", inplace=True)
 
+    with st.sidebar.expander("🔍 Filtros", expanded=False):
+        categorias_filtro = st.multiselect(
+            "Categorias",
+            options=sorted(df_filtro["categoria"].dropna().unique()),
+            default=sorted(df_filtro["categoria"].dropna().unique())
+        )
 
-if not df_filtrado.empty:
+        inicio_periodo, final_periodo = st.date_input(
+            "Período",
+            value=(df_filtro["data"].min().date(), df_filtro["data"].max().date())
+        )
 
-        tabela_com_gastos = df_filtrado[df_filtrado["Valor"] < 0]
-        
-        dados_pizza = tabela_com_gastos.groupby("Categoria") ["Valor"].sum().abs().reset_index()
-        dados_barras = tabela_com_gastos.nsmallest(5, "Valor").copy()
-        dados_barras["Valor"]= dados_barras["Valor"].abs()
+    df_filtrado = df_filtro.loc[
+        (df_filtro["categoria"].isin(categorias_filtro)) & 
+        (df_filtro["data"].between(pd.to_datetime(inicio_periodo), pd.to_datetime(final_periodo)))
+    ]
 
-        grafico_pizza = px.pie(dados_pizza, names="Categoria", values="Valor", title="Distribuição de Despesas")
-        st.plotly_chart(grafico_pizza, use_container_width=True)
+    st.title("💰 Dashboard - Mesada")
+    col1, col2, col3, col4 = st.columns(4)
 
-        grafico_barras = px.bar(dados_barras, x = "Descrição", y = "Valor", title="Top 5 Despesas", text_auto=True)
-        st.plotly_chart(grafico_barras, use_container_width=True)
+    with col1:
+        total = df_filtrado["valor"].sum()
+        st.metric("💵 Saldo Total", f"R$ {total:,.2f}")
 
+    with col2:
+        entradas = df_filtrado[df_filtrado["valor"] > 0]["valor"].sum()
+        st.metric("📈 Entradas", f"R$ {entradas:,.2f}")
 
-csv_operacoes = df_filtrado.to_csv(index=False).encode("utf-8")
-st.download_button("Baixar CSV Filtrado", csv_operacoes, "mesada_filtro.csv", "text/csv")
+    with col3:
+        saidas = df_filtrado[df_filtrado["valor"] < 0]["valor"].sum()
+        st.metric("📉 Saídas", f"R$ {saidas:,.2f}")
+
+    with col4:
+        transacoes = len(df_filtrado)
+        st.metric("📋 Transações", transacoes)
+
+    st.subheader("📈 Análises")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if not df_filtrado.empty:
+            gastos_categoria = df_filtrado.groupby("categoria")["valor"].sum().sort_values()
+            fig_categoria = px.bar(
+                x=gastos_categoria.values,
+                y=gastos_categoria.index,
+                orientation="h",
+                title="Valor por Categoria",
+                labels={"x": "Valor (R$)", "y": "Categoria"},
+                color=gastos_categoria.values,
+                color_continuous_scale="RdYlGn"
+            )
+            st.plotly_chart(fig_categoria, width='stretch')
+
+    with col2:
+        if not df_filtrado.empty:
+            evolucao = df_filtrado.sort_values("data").groupby("data")["valor"].sum().cumsum()
+            fig_evolucao = px.line(
+                x=evolucao.index,
+                y=evolucao.values,
+                title="Evolução do Saldo",
+                labels={"x": "Data", "y": "Saldo Acumulado (R$)"},
+                markers=True
+            )
+            st.plotly_chart(fig_evolucao, width='stretch')
+
+    st.subheader("📋 Transações")
+
+    df_exibir = df_filtrado[["data", "descricao", "categoria", "valor"]].copy()
+    df_exibir = df_exibir.sort_values("data", ascending=False)
+    df_exibir.columns = ["Data", "Descrição", "Categoria", "Valor"]
+    df_exibir["Valor"] = df_exibir["Valor"].apply(lambda x: f"R$ {x:,.2f}")
+
+    st.dataframe(df_exibir, width='stretch', hide_index=True)
+
+if st.sidebar.button("🚪 Sair"):
+    st.session_state.autenticado = False
+    st.session_state.dados = None
+    st.rerun()
